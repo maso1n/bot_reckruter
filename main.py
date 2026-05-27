@@ -33,12 +33,14 @@ SHEET_TAB = "общая"
 CREDENTIALS_FILE = "fluid-kiln-485023-d5-c5bf3a6eb7be.json"
 
 POLL_INTERVAL_SECONDS = 60
-LEAD_RESEND_INTERVAL_SECONDS = 60 * 60
-REPEAT_ASSIGNED_LEAD_SECONDS = 60 * 60
-PENDING_PROCESSING_REMIND_SECONDS = 30 * 60
+LEAD_RESEND_INTERVAL_SECONDS = 15 * 60
+REPEAT_ASSIGNED_LEAD_SECONDS = 15 * 60
+PENDING_PROCESSING_REMIND_SECONDS = 15 * 60
 BUSY_REMINDER_SECONDS = 15 * 60
+SHEET_RETRY_ATTEMPTS = 3
+SHEET_RETRY_DELAY_SECONDS = 1.5
 POLAND_TZ = ZoneInfo("Europe/Warsaw")
-QUIET_HOURS_START = 20  # 20:00 по Польше
+QUIET_HOURS_START = 23  # 20:00 по Польше
 QUIET_HOURS_END = 8  # 08:00 по Польше
 ADMIN_ALERT_CHAT_ID = ALLOWED_USERS[0] if ALLOWED_USERS else None
 ERROR_ALERT_DEBOUNCE_SECONDS = 300
@@ -205,7 +207,45 @@ def _validate_datetime_input(raw: str) -> tuple[Optional[datetime], Optional[str
 
 def _load_sheet_data() -> List[List[str]]:
     """Загружаем все данные таблицы одним запросом."""
-    return sheet.get_all_values()
+    last_error: Optional[Exception] = None
+    for attempt in range(1, SHEET_RETRY_ATTEMPTS + 1):
+        try:
+            return sheet.get_all_values()
+        except Exception as exc:
+            last_error = exc
+            if attempt == SHEET_RETRY_ATTEMPTS:
+                break
+            logging.warning(
+                "Ошибка чтения Google Sheets (попытка %s/%s): %s",
+                attempt,
+                SHEET_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(SHEET_RETRY_DELAY_SECONDS)
+    raise RuntimeError("Не удалось прочитать данные из Google Sheets") from last_error
+
+
+def _sheet_update_cell(row_id: int, col_id: int, value: str) -> None:
+    """Надёжная запись в таблицу с ретраями при временных ошибках сети/API."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, SHEET_RETRY_ATTEMPTS + 1):
+        try:
+            sheet.update_cell(row_id, col_id, value)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == SHEET_RETRY_ATTEMPTS:
+                break
+            logging.warning(
+                "Ошибка записи в Google Sheets (row=%s, col=%s, попытка %s/%s): %s",
+                row_id,
+                col_id,
+                attempt,
+                SHEET_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(SHEET_RETRY_DELAY_SECONDS)
+    raise RuntimeError(f"Не удалось записать ячейку R{row_id}C{col_id} в Google Sheets") from last_error
 
 
 def _is_quiet_hours() -> bool:
@@ -643,7 +683,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             due_ts = due_dt.timestamp()
             if now < due_ts:
                 continue
-            # Повторная отправка для закреплённого пользователя каждый час,
+            # Повторная отправка для закреплённого пользователя каждые 15 минут,
             # пока он не начнёт обработку.
             repeat_data = assigned_repeat.get(row_id)
             last_sent = repeat_data["last_sent"] if repeat_data else None
@@ -920,7 +960,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         # Закрепляем лид за пользователем в таблице.
-        sheet.update_cell(row_id, 2, str(user_id))  # колонка B (rekuter)
+        _sheet_update_cell(row_id, 2, str(user_id))  # колонка B (rekuter)
         # Удаляем отправленные ранее сообщения с этим лидом у других пользователей.
         sent_rows_data = sent_rows.pop(row_id, None)
         if sent_rows_data and sent_rows_data.get("message_ids"):
@@ -1184,13 +1224,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
         normalized_datetime = _format_datetime(due_dt)
-        sheet.update_cell(schedule_row_id, date_col, normalized_datetime)
+        _sheet_update_cell(schedule_row_id, date_col, normalized_datetime)
         status_col = _find_column(["status"])
         if status_col:
-            sheet.update_cell(schedule_row_id, status_col, "нет ответа")
+            _sheet_update_cell(schedule_row_id, status_col, "нет ответа")
         processed_col = _find_column(["processed at", "processed_at", "дата обработки"])
         if processed_col:
-            sheet.update_cell(schedule_row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
+            _sheet_update_cell(schedule_row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
         scheduled_leads[schedule_row_id] = {"user_id": user_id, "due_at": due_dt.timestamp()}
         pending_schedule_input.pop(user_id, None)
         user_busy_state.pop(user_id, None)
@@ -1267,30 +1307,30 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         # Записываем итоговые поля в таблицу.
-        sheet.update_cell(row_id, gender_col, lead_data.get("gender", ""))
-        sheet.update_cell(row_id, status_col, lead_data.get("status", ""))
+        _sheet_update_cell(row_id, gender_col, lead_data.get("gender", ""))
+        _sheet_update_cell(row_id, status_col, lead_data.get("status", ""))
         if age_col and lead_data.get("age"):
-            sheet.update_cell(row_id, age_col, lead_data.get("age", ""))
+            _sheet_update_cell(row_id, age_col, lead_data.get("age", ""))
         if nationality_col and lead_data.get("nationality"):
-            sheet.update_cell(row_id, nationality_col, lead_data.get("nationality", ""))
+            _sheet_update_cell(row_id, nationality_col, lead_data.get("nationality", ""))
         followup_datetime = lead_data.get("followup_datetime")
         if date_col and status_value in {"думает", "нет ответа"} and followup_datetime:
-            sheet.update_cell(row_id, date_col, followup_datetime)
+            _sheet_update_cell(row_id, date_col, followup_datetime)
         if date_col and status_value in {"отказался", "согласился", "не подходит"}:
-            sheet.update_cell(row_id, date_col, "")
+            _sheet_update_cell(row_id, date_col, "")
         prev_comment = _row_value(_load_sheet_data()[row_id - 1], comment_col)
         if prev_comment:
             merged_comment = f"{prev_comment}\n---\n{comment}"
         else:
             merged_comment = comment
         if lead_data.get("edit_mode"):
-            sheet.update_cell(row_id, comment_col, comment)
+            _sheet_update_cell(row_id, comment_col, comment)
         else:
-            sheet.update_cell(row_id, comment_col, merged_comment)
+            _sheet_update_cell(row_id, comment_col, merged_comment)
 
         processed_col = _find_column(["processed at", "processed_at", "дата обработки"])
         if processed_col:
-            sheet.update_cell(row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
+            _sheet_update_cell(row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
 
         await update.message.reply_text("✅ Данные сохранены в таблице.")
         await _cleanup_lead_messages(context, row_id)
@@ -1323,10 +1363,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
         normalized_datetime = _format_datetime(due_dt)
-        sheet.update_cell(row_id, date_col, normalized_datetime)
+        _sheet_update_cell(row_id, date_col, normalized_datetime)
         processed_col = _find_column(["processed at", "processed_at", "дата обработки"])
         if processed_col:
-            sheet.update_cell(row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
+            _sheet_update_cell(row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
         assigned_repeat.pop(row_id, None)
         scheduled_leads[row_id] = {"user_id": user_id, "due_at": due_dt.timestamp()}
         lead_data["awaiting_date_input"] = False
@@ -1577,4 +1617,3 @@ if __name__ == "__main__":
     app.add_error_handler(on_error)
     print("✅ Бот запущен")
     app.run_polling()
-
