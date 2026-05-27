@@ -32,15 +32,15 @@ SHEET_NAME = "лиды от бота"
 SHEET_TAB = "общая"
 CREDENTIALS_FILE = "fluid-kiln-485023-d5-c5bf3a6eb7be.json"
 
-POLL_INTERVAL_SECONDS = 60
-LEAD_RESEND_INTERVAL_SECONDS = 15 * 60
-REPEAT_ASSIGNED_LEAD_SECONDS = 15 * 60
-PENDING_PROCESSING_REMIND_SECONDS = 15 * 60
-BUSY_REMINDER_SECONDS = 15 * 60
+POLL_INTERVAL_SECONDS = 15 * 60
+LEAD_RESEND_INTERVAL_SECONDS = 30 * 60
+REPEAT_ASSIGNED_LEAD_SECONDS = 30 * 60
+PENDING_PROCESSING_REMIND_SECONDS = 30 * 60
+FORGOTTEN_LEAD_REMINDER_SECONDS = 30 * 60
 SHEET_RETRY_ATTEMPTS = 3
 SHEET_RETRY_DELAY_SECONDS = 1.5
 POLAND_TZ = ZoneInfo("Europe/Warsaw")
-QUIET_HOURS_START = 23  # 20:00 по Польше
+QUIET_HOURS_START = 20  # 20:00 по Польше
 QUIET_HOURS_END = 8  # 08:00 по Польше
 ADMIN_ALERT_CHAT_ID = ALLOWED_USERS[0] if ALLOWED_USERS else None
 ERROR_ALERT_DEBOUNCE_SECONDS = 300
@@ -246,6 +246,30 @@ def _sheet_update_cell(row_id: int, col_id: int, value: str) -> None:
             )
             time.sleep(SHEET_RETRY_DELAY_SECONDS)
     raise RuntimeError(f"Не удалось записать ячейку R{row_id}C{col_id} в Google Sheets") from last_error
+
+
+def _load_row_by_id(row_id: int) -> Optional[List[str]]:
+    """Надёжно читаем конкретную строку по её номеру в таблице."""
+    last_error: Optional[Exception] = None
+    for attempt in range(1, SHEET_RETRY_ATTEMPTS + 1):
+        try:
+            row = sheet.row_values(row_id)
+            if not row:
+                return None
+            return row
+        except Exception as exc:
+            last_error = exc
+            if attempt == SHEET_RETRY_ATTEMPTS:
+                break
+            logging.warning(
+                "Ошибка чтения строки Google Sheets (row=%s, попытка %s/%s): %s",
+                row_id,
+                attempt,
+                SHEET_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(SHEET_RETRY_DELAY_SECONDS)
+    raise RuntimeError(f"Не удалось прочитать строку R{row_id} из Google Sheets") from last_error
 
 
 def _is_quiet_hours() -> bool:
@@ -497,12 +521,42 @@ async def _send_missed_for_user(context: ContextTypes.DEFAULT_TYPE, user_id: int
                 row,
                 header="✅ Вы взяли этот лид и его нужно обработать.\n\n",
             )
-            assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id}
+            assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id, "user_id": user_id}
         except Exception:
             logging.exception("Не удалось дослать повторный лид пользователю %s", user_id)
 
 
 
+
+
+
+async def _clear_assigned_repeat_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    row_id: int,
+    user_id: Optional[int] = None,
+) -> None:
+    repeat_data = assigned_repeat.get(row_id)
+    if not repeat_data:
+        return
+    message_id = repeat_data.get("message_id")
+    if not message_id:
+        assigned_repeat.pop(row_id, None)
+        return
+    target_user = user_id
+    if target_user is None:
+        target_user = repeat_data.get("user_id")
+    if target_user is None:
+        row = _load_row_by_id(row_id)
+        if row:
+            rekruter = _row_value(row, 2)
+            if rekruter.isdigit():
+                target_user = int(rekruter)
+    if target_user is not None:
+        try:
+            await context.bot.delete_message(chat_id=target_user, message_id=message_id)
+        except Exception:
+            logging.exception("Не удалось удалить старое сообщение повтора для пользователя %s", target_user)
+    assigned_repeat.pop(row_id, None)
 
 async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Проверяем новые лиды, пересылаем непринятые и открываем запланированные."""
@@ -520,10 +574,10 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
     all_rows = all_values[1:]
     now = time.time()
 
-    # Напоминание занятому пользователю каждые 15 минут: сначала завершить взятый лид.
+    # Напоминание занятому пользователю с единым интервалом: сначала завершить взятый лид.
     for busy_user_id, busy_data in list(user_busy_state.items()):
         last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
-        if now - last_notice < BUSY_REMINDER_SECONDS:
+        if now - last_notice < FORGOTTEN_LEAD_REMINDER_SECONDS:
             continue
         try:
             busy_row_id = _busy_row_id(busy_user_id)
@@ -610,7 +664,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             if _busy_row_id(user_id) == row_id and 0 <= row_id - 2 < len(all_rows):
                 busy_data = user_busy_state.get(user_id, {})
                 last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
-                if now - last_notice >= BUSY_REMINDER_SECONDS:
+                if now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
                     await _cleanup_lead_messages(context, row_id)
                     await _resume_processing_for_user(context, user_id, row_id, all_rows[row_id - 2])
                     busy_data["last_notice"] = now
@@ -624,18 +678,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             scheduled_leads.pop(row_id, None)
             assigned_repeat.pop(row_id, None)
             continue
-        repeat_data = assigned_repeat.get(row_id)
-        if repeat_data and repeat_data.get("message_id"):
-            try:
-                await context.bot.delete_message(
-                    chat_id=user_id,
-                    message_id=repeat_data["message_id"],
-                )
-            except Exception:
-                logging.exception(
-                    "Не удалось удалить старое сообщение повтора для пользователя %s",
-                    user_id,
-                )
+        await _clear_assigned_repeat_message(context, row_id, user_id)
         message = await _send_schedule_prompt(
             context,
             user_id,
@@ -644,7 +687,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             header="✅ Вы взяли этот лид и его нужно обработать.\n\n",
         )
         scheduled_leads.pop(row_id, None)
-        assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id}
+        assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id, "user_id": user_id}
         handled_rows.add(row_id)
 
     # Проверяем лиды, закреплённые за пользователем, по дате/времени в таблице.
@@ -666,7 +709,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if _busy_row_id(assigned_user_id) == row_id:
                     busy_data = user_busy_state.get(assigned_user_id, {})
                     last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
-                    if now - last_notice >= BUSY_REMINDER_SECONDS:
+                    if now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
                         await _cleanup_lead_messages(context, row_id)
                         await _resume_processing_for_user(context, assigned_user_id, row_id, row)
                         busy_data["last_notice"] = now
@@ -683,7 +726,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             due_ts = due_dt.timestamp()
             if now < due_ts:
                 continue
-            # Повторная отправка для закреплённого пользователя каждые 15 минут,
+            # Повторная отправка для закреплённого пользователя каждые 30 минут,
             # пока он не начнёт обработку.
             repeat_data = assigned_repeat.get(row_id)
             last_sent = repeat_data["last_sent"] if repeat_data else None
@@ -713,7 +756,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
                     row,
                     header="✅ Вы взяли этот лид и его нужно обработать.\n\n",
                 )
-                assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id}
+                assigned_repeat[row_id] = {"last_sent": now, "message_id": message.message_id, "user_id": assigned_user_id}
             except Exception:
                 logging.exception(
                     "Не удалось отправить повторный лид пользователю %s",
@@ -908,11 +951,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if data.startswith("edit_"):
         row_id = int(data.split("_")[1])
-        all_values = _load_sheet_data()
-        if len(all_values) <= row_id - 1:
+        row = _load_row_by_id(row_id)
+        if not row:
             await query.edit_message_text("❗ Не удалось найти лид в таблице.")
             return
-        row = all_values[row_id - 1]
         user_mode[user_id] = "edit_history"
         _mark_user_busy(user_id, row_id)
         await query.edit_message_text("✏️ Редактирование лида запущено.")
@@ -942,11 +984,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Кнопка "Взять лид"
     if data.startswith("take_"):
         row_id = int(data.split("_")[1])
-        all_values = _load_sheet_data()
-        if len(all_values) <= row_id - 1:
+        row = _load_row_by_id(row_id)
+        if not row:
             await query.edit_message_text("❗ Не удалось найти лид в таблице.")
             return
-        row = all_values[row_id - 1]  # сдвиг из-за заголовков
         rekruter = _row_value(row, 2)
 
         # Если лид уже закреплён — сообщаем об этом.
@@ -980,6 +1021,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "✅ Лид взят. Этот лид закреплён за вами.",
         )
         _mark_user_busy(user_id, row_id)
+        await _clear_assigned_repeat_message(context, row_id, user_id)
         phone_col = _find_phone_column()
         phone = _row_value(row, phone_col)
         lead_text = _build_lead_text(row, phone)
@@ -1006,11 +1048,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         row_id = int(parts[1])
         action = parts[2]
         if action == "now":
-            all_values = _load_sheet_data()
-            if len(all_values) <= row_id - 1:
+            row = _load_row_by_id(row_id)
+            if not row:
                 await query.edit_message_text("❗ Не удалось найти лид в таблице.")
                 return
-            row = all_values[row_id - 1]
             if not _row_assigned_to_user(row, user_id):
                 pending_schedule_input.pop(user_id, None)
                 user_busy_state.pop(user_id, None)
@@ -1023,7 +1064,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logging.warning("Не удалось удалить сообщение с кнопками для лида %s", row_id)
             pending_schedule_input.pop(user_id, None)
             _mark_user_busy(user_id, row_id)
-            assigned_repeat[row_id] = {"last_sent": time.time(), "message_id": None}
+            await _clear_assigned_repeat_message(context, row_id, user_id)
+            assigned_repeat[row_id] = {"last_sent": time.time(), "message_id": None, "user_id": user_id}
             await start_lead_processing(context, user_id, row_id, row, note=False)
             return
 
@@ -1249,8 +1291,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Ожидаем возраст кандидата.
     if lead_data.get("awaiting_age"):
-        age_value = update.message.text.strip()
-        lead_data["age"] = age_value
+        age_raw = update.message.text or ""
+        age_compact = re.sub(r"\s+", "", age_raw)
+        if not age_compact.isdigit():
+            await update.message.reply_text("❗ Возраст должен содержать только цифры (например: 15).")
+            return
+        age_value = int(age_compact)
+        if age_value < 1 or age_value > 150:
+            await update.message.reply_text("❗ Возраст должен быть числом от 1 до 150.")
+            return
+        lead_data["age"] = str(age_value)
         lead_data["awaiting_age"] = False
         nationality_keyboard = InlineKeyboardMarkup(
             [
