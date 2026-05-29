@@ -32,10 +32,11 @@ SHEET_NAME = "лиды от бота"
 SHEET_TAB = "общая"
 CREDENTIALS_FILE = "fluid-kiln-485023-d5-c5bf3a6eb7be.json"
 
-POLL_INTERVAL_SECONDS = 15 * 60
+POLL_INTERVAL_SECONDS = 60
 LEAD_RESEND_INTERVAL_SECONDS = 30 * 60
-REPEAT_ASSIGNED_LEAD_SECONDS = 30 * 60
-PENDING_PROCESSING_REMIND_SECONDS = 30 * 60
+ASSIGNED_LEAD_REMINDER_SECONDS = 30 * 60
+REPEAT_ASSIGNED_LEAD_SECONDS = ASSIGNED_LEAD_REMINDER_SECONDS
+PENDING_PROCESSING_REMIND_SECONDS = ASSIGNED_LEAD_REMINDER_SECONDS
 FORGOTTEN_LEAD_REMINDER_SECONDS = 30 * 60
 SHEET_RETRY_ATTEMPTS = 3
 SHEET_RETRY_DELAY_SECONDS = 1.5
@@ -282,10 +283,14 @@ def _mark_user_busy(user_id: int, row_id: Optional[int] = None) -> None:
     """Фиксируем, что пользователь взял лид и занят его обработкой."""
     now = time.time()
     busy = user_busy_state.get(user_id, {})
+    prev_row_id = busy.get("row_id")
+    next_row_id = row_id if row_id is not None else prev_row_id
+    # Если пользователь начал новый лид, обнуляем таймер напоминаний.
+    is_new_row = next_row_id is not None and str(prev_row_id) != str(next_row_id)
     user_busy_state[user_id] = {
-        "row_id": row_id if row_id is not None else busy.get("row_id"),
-        "taken_at": busy.get("taken_at", now),
-        "last_notice": busy.get("last_notice", now),
+        "row_id": next_row_id,
+        "taken_at": now if is_new_row else busy.get("taken_at", now),
+        "last_notice": now if is_new_row else busy.get("last_notice", now),
     }
 
 
@@ -574,6 +579,9 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
     all_rows = all_values[1:]
     now = time.time()
 
+    # За один проход отправляем занятому пользователю не более одного напоминания.
+    reminded_busy_users = set()
+
     # Напоминание занятому пользователю с единым интервалом: сначала завершить взятый лид.
     for busy_user_id, busy_data in list(user_busy_state.items()):
         last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
@@ -587,6 +595,7 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await _cleanup_lead_messages(context, busy_row_id)
                     await _resume_processing_for_user(context, busy_user_id, busy_row_id, busy_row)
                     busy_data["last_notice"] = now
+                    reminded_busy_users.add(busy_user_id)
                     continue
             await context.bot.send_message(
                 chat_id=busy_user_id,
@@ -664,10 +673,11 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
             if _busy_row_id(user_id) == row_id and 0 <= row_id - 2 < len(all_rows):
                 busy_data = user_busy_state.get(user_id, {})
                 last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
-                if now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
+                if user_id not in reminded_busy_users and now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
                     await _cleanup_lead_messages(context, row_id)
                     await _resume_processing_for_user(context, user_id, row_id, all_rows[row_id - 2])
                     busy_data["last_notice"] = now
+                    reminded_busy_users.add(user_id)
             continue
         row = all_rows[row_id - 2]
         rekruter_value = str(row[1]).strip() if len(row) >= 2 else ""
@@ -709,10 +719,11 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if _busy_row_id(assigned_user_id) == row_id:
                     busy_data = user_busy_state.get(assigned_user_id, {})
                     last_notice = busy_data.get("last_notice", busy_data.get("taken_at", now))
-                    if now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
+                    if assigned_user_id not in reminded_busy_users and now - last_notice >= FORGOTTEN_LEAD_REMINDER_SECONDS:
                         await _cleanup_lead_messages(context, row_id)
                         await _resume_processing_for_user(context, assigned_user_id, row_id, row)
                         busy_data["last_notice"] = now
+                        reminded_busy_users.add(assigned_user_id)
                 continue
             status_col = _find_column(["status"])
             if not _is_followup_status(_row_value(row, status_col)):
@@ -735,6 +746,12 @@ async def check_new_leads(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if row_id in pending_leads
                 else REPEAT_ASSIGNED_LEAD_SECONDS
             )
+            # Защита от неполных/старых записей в памяти: если last_sent потерялся,
+            # не шлём мгновенно каждую минуту, а инициализируем окно ожидания.
+            if repeat_data and not last_sent:
+                repeat_data["last_sent"] = now
+                assigned_repeat[row_id] = repeat_data
+                continue
             if last_sent and now - last_sent < remind_interval:
                 continue
             if repeat_data and repeat_data.get("message_id"):
@@ -1071,7 +1088,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if action == "later":
             pending_schedule_input[user_id] = row_id
-            assigned_repeat.pop(row_id, None)
+            await _clear_assigned_repeat_message(context, row_id, user_id)
             await query.edit_message_text(
                 "🗓 Введите дату и время обработки в формате ддммгггг ччмм"
             )
@@ -1417,7 +1434,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         processed_col = _find_column(["processed at", "processed_at", "дата обработки"])
         if processed_col:
             _sheet_update_cell(row_id, processed_col, datetime.now(POLAND_TZ).strftime("%d.%m.%Y %H:%M"))
-        assigned_repeat.pop(row_id, None)
+        await _clear_assigned_repeat_message(context, row_id, user_id)
         scheduled_leads[row_id] = {"user_id": user_id, "due_at": due_dt.timestamp()}
         lead_data["awaiting_date_input"] = False
         lead_data["followup_datetime"] = normalized_datetime
